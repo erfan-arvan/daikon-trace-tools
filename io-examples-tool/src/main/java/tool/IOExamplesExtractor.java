@@ -33,6 +33,15 @@ import java.util.zip.GZIPInputStream;
  * <p>No Daikon invariant inference is involved -- this only reads the raw trace records Chicory
  * already produced from a real test run, pairing each method-entry record with its matching exit
  * record via Daikon's {@code this_invocation_nonce} field.
+ *
+ * <p>Reads and processes the trace one block (blank-line-separated paragraph) at a time rather
+ * than materializing the whole file as {@code List<List<String>>} first -- traces from
+ * array-heavy code can run into the hundreds of GB, far past what fits in any heap as Java
+ * objects all at once. Individual lines are also read through a bounded reader: Daikon's dtrace
+ * format writes array-valued variables element-by-element inline on one line, so a single
+ * variable holding a large array can itself be many GB long. Bounding the read means a
+ * pathological line gets truncated (documented as such in the output) instead of failing the
+ * whole extraction with an OutOfMemoryError from a single {@code String} allocation.
  */
 public class IOExamplesExtractor {
 
@@ -40,6 +49,13 @@ public class IOExamplesExtractor {
 
   /** Maximum number of examples retained per method in the output JSON. */
   private static final int MAX_EXAMPLES_PER_METHOD = 20;
+
+  /**
+   * Maximum characters kept per line. Daikon dumps array-valued variables inline on one line, so
+   * this is a real limit some lines legitimately hit, not just a safety margin -- lines past this
+   * are truncated (with a marker appended) rather than fully materialized.
+   */
+  private static final int MAX_LINE_CHARS = 1_000_000;
 
   public static void main(String[] args) throws Exception {
     Map<String, String> opts = parseArgs(args);
@@ -51,64 +67,37 @@ public class IOExamplesExtractor {
     System.out.println("[io-examples-tool] src=" + srcRoot);
     System.out.println("[io-examples-tool] out=" + outPath);
 
-    // pptBaseName (e.g. "com.example.MathUtils.add(int, int)") -> list of {args, return} records
-    Map<String, List<Map<String, Object>>> byPpt = new LinkedHashMap<>();
-
-    // nonce -> args recorded at the matching ENTER, awaiting its EXIT
-    Map<String, Map<String, String>> pendingEntries = new LinkedHashMap<>();
-
-    int enterCount = 0;
-    int pairedCount = 0;
+    TraceCollector collector = new TraceCollector();
 
     try (BufferedReader reader = openReader(dtracePath)) {
-      List<List<String>> blocks = readBlocks(reader);
-
-      for (List<String> block : blocks) {
-        String header = block.get(0);
-        if (header.startsWith("ppt ")) continue; // declaration block, not a data sample
-
-        Matcher m = SAMPLE_HEADER.matcher(header);
-        if (!m.matches()) continue; // preamble (decl-version, var-comparability, ...)
-
-        String pptBaseName = m.group(1);
-        boolean isEnter = m.group(2).equals("ENTER");
-
-        Map<String, String> vars = parseVarTriples(block.subList(1, block.size()));
-        String nonce = vars.get("this_invocation_nonce");
-        if (nonce == null) continue;
-
-        if (isEnter) {
-          enterCount++;
-          Map<String, String> entryArgs = new LinkedHashMap<>(vars);
-          entryArgs.remove("this_invocation_nonce");
-          pendingEntries.put(nonce, entryArgs);
+      List<String> current = new ArrayList<>();
+      String line;
+      while ((line = readBoundedLine(reader)) != null) {
+        if (line.isBlank()) {
+          if (!current.isEmpty()) {
+            collector.processBlock(current);
+            current = new ArrayList<>();
+          }
         } else {
-          Map<String, String> entryArgs = pendingEntries.remove(nonce);
-          if (entryArgs == null) continue; // EXIT with no matching ENTER (truncated trace, etc.)
-
-          List<Map<String, Object>> examples =
-              byPpt.computeIfAbsent(pptBaseName, k -> new ArrayList<>());
-          if (examples.size() >= MAX_EXAMPLES_PER_METHOD) continue;
-
-          Map<String, Object> record = new LinkedHashMap<>();
-          record.put("args", entryArgs);
-          record.put("return", vars.get("return"));
-          examples.add(record);
-          pairedCount++;
+          current.add(line);
         }
+      }
+      if (!current.isEmpty()) {
+        collector.processBlock(current);
       }
     }
 
-    System.out.println("[io-examples-tool] ENTER records=" + enterCount);
-    System.out.println("[io-examples-tool] paired ENTER/EXIT examples=" + pairedCount);
-    System.out.println("[io-examples-tool] distinct program points=" + byPpt.size());
+    System.out.println("[io-examples-tool] ENTER records=" + collector.enterCount);
+    System.out.println("[io-examples-tool] paired ENTER/EXIT examples=" + collector.pairedCount);
+    System.out.println("[io-examples-tool] truncated lines=" + truncatedLineTotal);
+    System.out.println("[io-examples-tool] distinct program points=" + collector.byPpt.size());
 
     SourceKeyResolver resolver = new SourceKeyResolver(Path.of(srcRoot));
     Map<String, List<Map<String, Object>>> index = new LinkedHashMap<>();
     int resolved = 0;
     int unresolved = 0;
 
-    for (Map.Entry<String, List<Map<String, Object>>> e : byPpt.entrySet()) {
+    for (Map.Entry<String, List<Map<String, Object>>> e : collector.byPpt.entrySet()) {
       String key = resolver.resolveKey(e.getKey());
       if (key == null) {
         unresolved++;
@@ -127,34 +116,69 @@ public class IOExamplesExtractor {
   }
 
   /**
-   * Splits the trace file into blank-line-separated paragraphs ("blocks"), each block being either
-   * a declaration (starts with {@code "ppt "}) or a data sample (starts with a program point name
-   * ending in {@code :::ENTER} or {@code :::EXIT<n>}).
+   * Holds the ENTER/EXIT pairing state across the whole streamed pass, and processes one
+   * blank-line-separated block (a declaration, or a data sample) at a time.
    */
-  private static List<List<String>> readBlocks(BufferedReader reader) throws IOException {
-    List<List<String>> blocks = new ArrayList<>();
-    List<String> current = new ArrayList<>();
+  private static class TraceCollector {
+    // pptBaseName (e.g. "com.example.MathUtils.add(int, int)") -> list of {args, return} records
+    final Map<String, List<Map<String, Object>>> byPpt = new LinkedHashMap<>();
 
-    String line;
-    while ((line = reader.readLine()) != null) {
-      if (line.isBlank()) {
-        if (!current.isEmpty()) {
-          blocks.add(current);
-          current = new ArrayList<>();
-        }
+    // nonce -> args recorded at the matching ENTER, awaiting its EXIT
+    final Map<String, Map<String, String>> pendingEntries = new LinkedHashMap<>();
+
+    int enterCount = 0;
+    int pairedCount = 0;
+
+    void processBlock(List<String> block) {
+      String header = block.get(0);
+      if (header.startsWith("ppt ")) return; // declaration block, not a data sample
+
+      Matcher m = SAMPLE_HEADER.matcher(header);
+      if (!m.matches()) return; // preamble (decl-version, var-comparability, ...)
+
+      String pptBaseName = m.group(1);
+      boolean isEnter = m.group(2).equals("ENTER");
+
+      Map<String, String> vars = parseVarTriples(block.subList(1, block.size()));
+      String nonce = vars.get("this_invocation_nonce");
+      if (nonce == null) return;
+
+      if (isEnter) {
+        enterCount++;
+        Map<String, String> entryArgs = new LinkedHashMap<>(vars);
+        entryArgs.remove("this_invocation_nonce");
+        pendingEntries.put(nonce, entryArgs);
       } else {
-        current.add(line);
+        Map<String, String> entryArgs = pendingEntries.remove(nonce);
+        if (entryArgs == null) return; // EXIT with no matching ENTER (truncated trace, etc.)
+
+        List<Map<String, Object>> examples = byPpt.computeIfAbsent(pptBaseName, k -> new ArrayList<>());
+        if (examples.size() >= MAX_EXAMPLES_PER_METHOD) return;
+
+        Map<String, Object> record = new LinkedHashMap<>();
+        record.put("args", entryArgs);
+        record.put("return", vars.get("return"));
+        examples.add(record);
+        pairedCount++;
       }
     }
-    if (!current.isEmpty()) blocks.add(current);
-
-    return blocks;
   }
 
   /** Parses a data sample's body (name/value/mod-bit triples) into a var-name -> value map. */
   private static Map<String, String> parseVarTriples(List<String> lines) {
     Map<String, String> vars = new LinkedHashMap<>();
-    for (int i = 0; i + 2 < lines.size(); i += 3) {
+    int i = 0;
+    // this_invocation_nonce is a special 2-line variable (name + value only, no mod-bit line) --
+    // every other variable is a 3-line (name, value, mod-bit) triple. Without special-casing this,
+    // a fixed stride-3 loop starting at line 0 stays permanently off by one for the rest of the
+    // block: each (name, value, mod-bit) triple gets read as (value, mod-bit, next-name), so the
+    // map ends up keyed by values instead of names, and the final variable in the block is dropped
+    // entirely because the misalignment consumes one variable's worth of lines off the end.
+    if (i + 1 < lines.size() && lines.get(i).equals("this_invocation_nonce")) {
+      vars.put(lines.get(i), lines.get(i + 1));
+      i += 2;
+    }
+    for (; i + 2 < lines.size(); i += 3) {
       String name = lines.get(i);
       String value = lines.get(i + 1);
       // mod-bit at lines.get(i + 2) is intentionally ignored
@@ -170,6 +194,59 @@ public class IOExamplesExtractor {
     }
     return new BufferedReader(new InputStreamReader(in, StandardCharsets.UTF_8));
   }
+
+  /**
+   * Reads one line, same contract as {@link BufferedReader#readLine()} (returns {@code null} at
+   * EOF, strips the line terminator, treats \n/\r\n/\r as terminators) except length-bounded:
+   * once a line exceeds {@link #MAX_LINE_CHARS}, the rest of it is drained and discarded (never
+   * appended to the returned string) rather than being fully materialized, and a truncation
+   * marker is appended so the caller can tell the value is incomplete. This is what actually
+   * fixes the OutOfMemoryError a plain {@code readLine()} hits on a single huge array-valued
+   * line -- no heap size fixes a single contiguous allocation that's itself gigabytes long.
+   */
+  private static String readBoundedLine(BufferedReader reader) throws IOException {
+    StringBuilder sb = null;
+    boolean truncated = false;
+    boolean sawAnyChar = false;
+
+    int c;
+    while ((c = reader.read()) != -1) {
+      sawAnyChar = true;
+      if (c == '\n') {
+        break;
+      }
+      if (c == '\r') {
+        reader.mark(1);
+        int next = reader.read();
+        if (next != '\n' && next != -1) {
+          reader.reset();
+        }
+        break;
+      }
+      if (sb == null) sb = new StringBuilder();
+      if (sb.length() < MAX_LINE_CHARS) {
+        sb.append((char) c);
+      } else {
+        truncated = true;
+        // intentionally not appended -- draining the rest of this line without retaining it
+        // is the whole point: an oversized line must never be held in memory in full.
+      }
+    }
+
+    if (!sawAnyChar) return null; // true EOF, no partial line pending
+
+    String result = sb == null ? "" : sb.toString();
+    if (truncated) {
+      truncatedLineTotal++;
+      result = result + " ...<truncated: line exceeded " + MAX_LINE_CHARS + " chars>";
+    }
+    return result;
+  }
+
+  // Static counter mirrored into TraceCollector.truncatedLineCount at the end of main(); kept
+  // here (not as a TraceCollector field) because readBoundedLine() is called before any
+  // TraceCollector block is available to attribute it to.
+  private static long truncatedLineTotal = 0;
 
   private static Map<String, String> parseArgs(String[] args) {
     Map<String, String> m = new java.util.HashMap<>();
@@ -266,4 +343,3 @@ public class IOExamplesExtractor {
     }
   }
 }
-
