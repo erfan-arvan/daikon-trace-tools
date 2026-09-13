@@ -304,7 +304,16 @@ public class IOExamplesExtractor {
       String simpleClassName =
           classDot < 0 ? qualifiedClass : qualifiedClass.substring(classDot + 1);
 
-      Path file = srcRoot.resolve(pkg.replace('.', '/') + "/" + simpleClassName + ".java");
+      // Daikon reports nested classes as "Outer$Inner" -- there's no "Outer$Inner.java" file,
+      // only "Outer.java". Look the file up by the top-level name, but resolve/key by the
+      // innermost simple name, matching daikonplusplus's own (JavaProjectScanner) key format,
+      // which already drops the outer-class prefix for nested classes.
+      int dollarIdx = simpleClassName.indexOf('$');
+      String fileClassName = dollarIdx < 0 ? simpleClassName : simpleClassName.substring(0, dollarIdx);
+      String keyClassName =
+          dollarIdx < 0 ? simpleClassName : simpleClassName.substring(simpleClassName.lastIndexOf('$') + 1);
+
+      Path file = srcRoot.resolve(pkg.replace('.', '/') + "/" + fileClassName + ".java");
       if (!Files.exists(file)) return null;
 
       CompilationUnit cu =
@@ -321,7 +330,7 @@ public class IOExamplesExtractor {
 
       java.util.Optional<ClassOrInterfaceDeclaration> maybeClass =
           cu.findFirst(
-              ClassOrInterfaceDeclaration.class, c -> c.getNameAsString().equals(simpleClassName));
+              ClassOrInterfaceDeclaration.class, c -> c.getNameAsString().equals(keyClassName));
       if (maybeClass.isEmpty()) return null;
 
       java.util.Optional<MethodDeclaration> maybeMethod =
@@ -339,7 +348,7 @@ public class IOExamplesExtractor {
       String desc = md.getNameAsString() + "(" + params + "):" + ret;
 
       String prefix = pkg.isEmpty() ? "" : pkg + ".";
-      return prefix + simpleClassName + "#" + desc;
+      return prefix + keyClassName + "#" + desc;
     }
   }
 }
