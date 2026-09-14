@@ -102,6 +102,7 @@ public class IOExamplesExtractor {
         "[io-examples-tool] forward index built: " + forwardIndex.size() + " declared members");
 
     Map<String, List<Map<String, Object>>> index = new LinkedHashMap<>();
+    List<String> unresolvedPpts = new ArrayList<>();
     int resolved = 0;
     int unresolved = 0;
 
@@ -109,10 +110,19 @@ public class IOExamplesExtractor {
       String key = forwardIndex.resolve(e.getKey());
       if (key == null) {
         unresolved++;
+        unresolvedPpts.add(e.getKey());
         continue;
       }
       resolved++;
       index.put(key, e.getValue());
+    }
+
+    String unresolvedOutPath = opts.get("unresolved-out");
+    if (unresolvedOutPath != null) {
+      Files.write(Path.of(unresolvedOutPath), unresolvedPpts);
+      System.out.println(
+          "[io-examples-tool] wrote " + unresolvedPpts.size() + " unresolved ppt names to "
+              + unresolvedOutPath);
     }
 
     System.out.println("[io-examples-tool] resolved program points=" + resolved);
