@@ -3,8 +3,11 @@ package tool;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.github.javaparser.StaticJavaParser;
 import com.github.javaparser.ast.CompilationUnit;
+import com.github.javaparser.ast.Node;
 import com.github.javaparser.ast.body.ClassOrInterfaceDeclaration;
+import com.github.javaparser.ast.body.ConstructorDeclaration;
 import com.github.javaparser.ast.body.MethodDeclaration;
+import com.github.javaparser.ast.body.Parameter;
 
 import java.io.BufferedReader;
 import java.io.File;
@@ -16,6 +19,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -92,19 +96,33 @@ public class IOExamplesExtractor {
     System.out.println("[io-examples-tool] truncated lines=" + truncatedLineTotal);
     System.out.println("[io-examples-tool] distinct program points=" + collector.byPpt.size());
 
-    SourceKeyResolver resolver = new SourceKeyResolver(Path.of(srcRoot));
+    System.out.println("[io-examples-tool] scanning source tree to build forward index...");
+    ForwardSourceIndex forwardIndex = ForwardSourceIndex.build(Path.of(srcRoot));
+    System.out.println(
+        "[io-examples-tool] forward index built: " + forwardIndex.size() + " declared members");
+
     Map<String, List<Map<String, Object>>> index = new LinkedHashMap<>();
+    List<String> unresolvedPpts = new ArrayList<>();
     int resolved = 0;
     int unresolved = 0;
 
     for (Map.Entry<String, List<Map<String, Object>>> e : collector.byPpt.entrySet()) {
-      String key = resolver.resolveKey(e.getKey());
+      String key = forwardIndex.resolve(e.getKey());
       if (key == null) {
         unresolved++;
+        unresolvedPpts.add(e.getKey());
         continue;
       }
       resolved++;
       index.put(key, e.getValue());
+    }
+
+    String unresolvedOutPath = opts.get("unresolved-out");
+    if (unresolvedOutPath != null) {
+      Files.write(Path.of(unresolvedOutPath), unresolvedPpts);
+      System.out.println(
+          "[io-examples-tool] wrote " + unresolvedPpts.size() + " unresolved ppt names to "
+              + unresolvedOutPath);
     }
 
     System.out.println("[io-examples-tool] resolved program points=" + resolved);
@@ -266,89 +284,193 @@ public class IOExamplesExtractor {
   }
 
   /**
-   * Resolves a Daikon program-point base name (e.g. {@code "com.example.MathUtils.add(int, int)"})
-   * to the {@code pkg.Class#name(paramTypes):returnType} key format daikonplusplus uses, by
-   * locating the method in source and rebuilding the descriptor the same way
-   * MethodSignatureUtil.jvmDescriptorBestEffort does.
+   * Resolves Daikon program-point base names (e.g. {@code
+   * "com.example.Outer$Inner.method(java.lang.String,int)"}) to the {@code
+   * pkg.Class#name(paramTypes):returnType} key format daikonplusplus uses.
    *
-   * <p>Like the call-site tool's equivalent resolver, this matches by declaring (simple) class name
-   * and parameter count -- it does not attempt to resolve nested/inner classes whose file name
-   * differs from the class's own simple name.
+   * <p>This is a forward index, not a reverse lookup: the whole source tree is scanned once,
+   * up front, and every declared method AND constructor (the earlier reverse-parsing resolver
+   * only ever considered methods, so every constructor ppt was unconditionally unresolved) is
+   * registered under a signature comparable against Daikon's own ppt strings -- fully-qualified
+   * declaring class (with {@code $} for nesting, matching Chicory's own naming), member name, and
+   * a simplified (package-stripped, generics-erased) parameter-type list. Trace-side ppt names are
+   * normalized the same way before lookup, so matching is an exact map lookup, not string-splitting
+   * a file path back out of the trace and hoping it corresponds to a real file (the previous
+   * SourceKeyResolver's approach, which broke on nested classes, and always broke on constructors).
+   *
+   * <p>Known remaining gap: lambdas and anonymous classes have no source-declared node at all
+   * (Daikon reports synthetic names like {@code Foo$$Lambda/0x...} or {@code Foo$1}), so they
+   * can never appear in this index regardless of resolution strategy -- there is nothing in the
+   * .java text to enumerate. Overload ambiguity is also only reduced, not eliminated: two
+   * overloads whose parameters have the same simple type names from different packages would
+   * collide (rare in practice); this index also does not attempt full symbol resolution.
    */
-  static class SourceKeyResolver {
-    private final Path srcRoot;
-    private final Map<String, CompilationUnit> parsedFiles = new java.util.HashMap<>();
+  static class ForwardSourceIndex {
+    // "qualifiedClass$WithDollar#member(paramCount)|simpleType1,simpleType2,..." -> final key
+    private final Map<String, String> byTraceSignature = new LinkedHashMap<>();
 
-    SourceKeyResolver(Path srcRoot) {
-      this.srcRoot = srcRoot;
+    static ForwardSourceIndex build(Path srcRoot) throws IOException {
+      ForwardSourceIndex index = new ForwardSourceIndex();
+      try (var stream = Files.walk(srcRoot)) {
+        stream
+            .filter(p -> p.toString().endsWith(".java"))
+            .forEach(
+                file -> {
+                  try {
+                    CompilationUnit cu = StaticJavaParser.parse(file);
+                    String pkg =
+                        cu.getPackageDeclaration().map(pd -> pd.getName().asString()).orElse("");
+                    cu.findAll(ClassOrInterfaceDeclaration.class)
+                        .forEach(
+                            cls -> {
+                              String qualifiedClass = qualifiedNameWithDollar(pkg, cls);
+                              cls.getMethods().forEach(md -> index.addMethod(qualifiedClass, md));
+                              cls.getConstructors()
+                                  .forEach(cd -> index.addConstructor(qualifiedClass, cd));
+                            });
+                  } catch (Exception e) {
+                    // skip unparsable file, same tolerance as the rest of the pipeline
+                  }
+                });
+      }
+      return index;
     }
 
-    String resolveKey(String pptBaseName) {
+    int size() {
+      return byTraceSignature.size();
+    }
+
+    /** Builds "pkg.Outer$Inner" by walking up through enclosing type declarations. */
+    private static String qualifiedNameWithDollar(String pkg, ClassOrInterfaceDeclaration cls) {
+      List<String> parts = new ArrayList<>();
+      parts.add(cls.getNameAsString());
+      Node parent = cls.getParentNode().orElse(null);
+      while (parent instanceof ClassOrInterfaceDeclaration) {
+        parts.add(0, ((ClassOrInterfaceDeclaration) parent).getNameAsString());
+        parent = parent.getParentNode().orElse(null);
+      }
+      String qualified = String.join("$", parts);
+      return pkg.isEmpty() ? qualified : pkg + "." + qualified;
+    }
+
+    private static String innermostSimpleName(String qualifiedClassWithDollar) {
+      int lastDot = qualifiedClassWithDollar.lastIndexOf('.');
+      String simple =
+          lastDot < 0 ? qualifiedClassWithDollar : qualifiedClassWithDollar.substring(lastDot + 1);
+      int lastDollar = simple.lastIndexOf('$');
+      return lastDollar < 0 ? simple : simple.substring(lastDollar + 1);
+    }
+
+    /**
+     * Strips generics and package-qualification down to a bare simple-name form comparable
+     * against Daikon's fully-qualified, erased runtime type strings -- e.g. {@code "List<String>"}
+     * (source) and {@code "java.util.List"} (trace) both simplify to {@code "List"}; a varargs
+     * parameter simplifies the same way its array-typed trace counterpart would ({@code
+     * "String..."} -> {@code "String[]"}).
+     */
+    private static String simplifyType(String syntacticType, boolean isVarArgs) {
+      String t = syntacticType.trim();
+      int lt = t.indexOf('<');
+      if (lt >= 0) t = t.substring(0, lt).trim();
+      if (isVarArgs) t = t + "[]";
+
+      String arraySuffix = "";
+      while (t.endsWith("[]")) {
+        arraySuffix += "[]";
+        t = t.substring(0, t.length() - 2).trim();
+      }
+      int lastDot = t.lastIndexOf('.');
+      if (lastDot >= 0) t = t.substring(lastDot + 1);
+      return t + arraySuffix;
+    }
+
+    private static String traceSignature(
+        String qualifiedClass, String memberName, List<String> simpleParamTypes) {
+      return qualifiedClass
+          + "#"
+          + memberName
+          + "("
+          + simpleParamTypes.size()
+          + ")|"
+          + String.join(",", simpleParamTypes);
+    }
+
+    private void addMethod(String qualifiedClass, MethodDeclaration md) {
+      List<String> simpleParamTypes = simplifyParams(md.getParameters());
+      String signature = traceSignature(qualifiedClass, md.getNameAsString(), simpleParamTypes);
+
+      String syntacticParams =
+          md.getParameters().stream().map(p -> p.getType().toString()).collect(Collectors.joining(","));
+      String finalKey =
+          buildFinalKey(
+              qualifiedClass, md.getNameAsString(), syntacticParams, md.getType().toString());
+
+      byTraceSignature.putIfAbsent(signature, finalKey);
+    }
+
+    private void addConstructor(String qualifiedClass, ConstructorDeclaration cd) {
+      // A constructor's name in javaparser's AST is already the enclosing class's simple name,
+      // which is exactly how Chicory/Daikon report it in the ppt string too (e.g. "Foo.Foo(...)").
+      String ctorName = cd.getNameAsString();
+      List<String> simpleParamTypes = simplifyParams(cd.getParameters());
+      String signature = traceSignature(qualifiedClass, ctorName, simpleParamTypes);
+
+      String syntacticParams =
+          cd.getParameters().stream().map(p -> p.getType().toString()).collect(Collectors.joining(","));
+      // daikonplusplus's own JavaProjectScanner does not currently scan constructors as program
+      // points at all, so there is no live "return type" convention for them to match -- "void"
+      // is a placeholder, not a claim that this key is presently queryable by the live tool.
+      String finalKey = buildFinalKey(qualifiedClass, ctorName, syntacticParams, "void");
+
+      byTraceSignature.putIfAbsent(signature, finalKey);
+    }
+
+    private static List<String> simplifyParams(List<Parameter> params) {
+      List<String> out = new ArrayList<>();
+      for (Parameter p : params) {
+        out.add(simplifyType(p.getType().toString(), p.isVarArgs()));
+      }
+      return out;
+    }
+
+    private static String buildFinalKey(
+        String qualifiedClass, String memberName, String syntacticParams, String syntacticReturn) {
+      int lastDot = qualifiedClass.lastIndexOf('.');
+      String pkg = lastDot < 0 ? "" : qualifiedClass.substring(0, lastDot);
+      String prefix = pkg.isEmpty() ? "" : pkg + ".";
+      String innermost = innermostSimpleName(qualifiedClass);
+      return prefix + innermost + "#" + memberName + "(" + syntacticParams + "):" + syntacticReturn;
+    }
+
+    /**
+     * Given a raw Daikon ppt base name, looks up the matching daikonplusplus key, or {@code null}
+     * if nothing declared in the scanned source matches (e.g. a lambda/anonymous class, or a
+     * class outside the scanned {@code --src} root).
+     */
+    String resolve(String pptBaseName) {
       int paren = pptBaseName.indexOf('(');
       int closeParen = pptBaseName.lastIndexOf(')');
       if (paren < 0 || closeParen < paren) return null;
 
       String beforeParen = pptBaseName.substring(0, paren);
       String paramsPart = pptBaseName.substring(paren + 1, closeParen);
-      int paramCount =
-          paramsPart.isBlank() ? 0 : paramsPart.split(",").length;
 
       int lastDot = beforeParen.lastIndexOf('.');
       if (lastDot < 0) return null;
 
       String qualifiedClass = beforeParen.substring(0, lastDot);
-      String methodName = beforeParen.substring(lastDot + 1);
+      String memberName = beforeParen.substring(lastDot + 1);
 
-      int classDot = qualifiedClass.lastIndexOf('.');
-      String pkg = classDot < 0 ? "" : qualifiedClass.substring(0, classDot);
-      String simpleClassName =
-          classDot < 0 ? qualifiedClass : qualifiedClass.substring(classDot + 1);
+      List<String> simpleParamTypes =
+          paramsPart.isBlank()
+              ? List.of()
+              : Arrays.stream(paramsPart.split(","))
+                  .map(String::trim)
+                  .map(t -> simplifyType(t, false))
+                  .collect(Collectors.toList());
 
-      // Daikon reports nested classes as "Outer$Inner" -- there's no "Outer$Inner.java" file,
-      // only "Outer.java". Look the file up by the top-level name, but resolve/key by the
-      // innermost simple name, matching daikonplusplus's own (JavaProjectScanner) key format,
-      // which already drops the outer-class prefix for nested classes.
-      int dollarIdx = simpleClassName.indexOf('$');
-      String fileClassName = dollarIdx < 0 ? simpleClassName : simpleClassName.substring(0, dollarIdx);
-      String keyClassName =
-          dollarIdx < 0 ? simpleClassName : simpleClassName.substring(simpleClassName.lastIndexOf('$') + 1);
-
-      Path file = srcRoot.resolve(pkg.replace('.', '/') + "/" + fileClassName + ".java");
-      if (!Files.exists(file)) return null;
-
-      CompilationUnit cu =
-          parsedFiles.computeIfAbsent(
-              file.toString(),
-              p -> {
-                try {
-                  return StaticJavaParser.parse(file);
-                } catch (Exception e) {
-                  return null;
-                }
-              });
-      if (cu == null) return null;
-
-      java.util.Optional<ClassOrInterfaceDeclaration> maybeClass =
-          cu.findFirst(
-              ClassOrInterfaceDeclaration.class, c -> c.getNameAsString().equals(keyClassName));
-      if (maybeClass.isEmpty()) return null;
-
-      java.util.Optional<MethodDeclaration> maybeMethod =
-          maybeClass.get().getMethodsByName(methodName).stream()
-              .filter(md -> md.getParameters().size() == paramCount)
-              .findFirst();
-      if (maybeMethod.isEmpty()) return null;
-
-      MethodDeclaration md = maybeMethod.get();
-      String params =
-          md.getParameters().stream()
-              .map(p -> p.getType().toString())
-              .collect(Collectors.joining(","));
-      String ret = md.getType().toString();
-      String desc = md.getNameAsString() + "(" + params + "):" + ret;
-
-      String prefix = pkg.isEmpty() ? "" : pkg + ".";
-      return prefix + keyClassName + "#" + desc;
+      String signature = traceSignature(qualifiedClass, memberName, simpleParamTypes);
+      return byTraceSignature.get(signature);
     }
   }
 }
